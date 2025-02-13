@@ -18,6 +18,7 @@ func main() {
 	lonPtr := flag.Float64("lon", 0, "Longitude")
 	maxPtr := flag.Int("max", 10, "Maximum number of results")
 	distPtr := flag.Float64("dist", 5, "Maximum distance away to consider")
+	jsonPtr := flag.String("json", "", "Output as JSON, can provide jq filter")
 
 	flag.Parse()
 
@@ -25,6 +26,7 @@ func main() {
 	lon := *lonPtr
 	max := *maxPtr
 	dist := *distPtr
+	json_out := *jsonPtr
 
 	wide := 0.04
 	url := fmt.Sprintf("https://petrolspy.com.au/webservice-1/station/box?neLat=%0.14f&neLng=%0.14f&swLat=%0.14f&swLng=%0.14f", lat-wide, lon-wide, lat+wide, lon+wide)
@@ -52,6 +54,46 @@ func main() {
 		os.Exit(1)
 	}
 
+	if json_out != "" {
+		query := fmt.Sprintf(`
+		def latitude: %0.14f;
+		def longitude: %0.14f;
+		def rows: %d;
+		def max_dist: %0.14f;
+		def to_radians($degrees): ($degrees | tonumber) * (3.14159265359 / 180);
+		def round(precision):.*pow(10;precision)|round/pow(10;precision);
+		def distance(lat1;lon1;lat2;lon2):
+			pow(to_radians(lon2)-to_radians(lon1);2)+pow(to_radians(lat2)-to_radians(lat1);2)|sqrt|. * 5450;
+	[.message.list[]|
+		select(.name | contains("Costco") | not)|
+		select(.updated < 24)|
+		[
+			select(.prices.U91.amount != null)|
+			select(((now-((.prices.U91.updated//now)/1000))/3600|floor) < 24)|
+			{
+				"type": "U91",
+				"price":.prices.U91.amount,
+				"updated":((now-((.prices.U91.updated//now)/1000))/3600|floor),
+				"name":.name,
+				"distance":distance(.location.y;.location.x;latitude;longitude)|round(2)
+			}|select(.distance < max_dist)
+		]+[
+			select(.prices.E10.amount != null)|
+			select(((now-((.prices.E10.updated//now)/1000))/3600|floor) < 24)|
+			{
+				"type": "E10",
+				"price":.prices.E10.amount,
+				"updated":((now-((.prices.E10.updated//now)/1000))/3600|floor),
+				"name":.name,
+				"distance":distance(.location.y;.location.x;latitude;longitude)|round(2)
+			}|select(.distance < max_dist)	
+		]|.[]
+	]|
+		sort_by(.price)|.[0:rows]|%s`, lat, lon, max, dist, json_out)
+		b, _ := json.Marshal(jq(query, data))
+		fmt.Printf("%s\n", b)
+		return
+	}
 	query := fmt.Sprintf(`
 		def latitude: %0.14f;
 		def longitude: %0.14f;
@@ -89,16 +131,16 @@ func main() {
 	[
 		sort_by(.price)|.[0:rows]|.[]|"\(.type)@\(.price):\(.name) \(.distance)km"
 	]|join("\n")`, lat, lon, max, dist)
-
 	// q, _ := gojq.Parse(query)
 
 	// fmt.Printf("http %s | jq -r '%s'\n\n", url, q.String())
 	fmt.Print(jq(query, data))
 }
 
-func jq(search string, data any) string {
+func jq(search string, data any) any {
 	query, _ := gojq.Parse(search)
 	//fmt.Println(query.String())
+	var collection []any
 	iter := query.Run(data)
 	for {
 		v, ok := iter.Next()
@@ -106,15 +148,19 @@ func jq(search string, data any) string {
 			break
 		}
 
-		if s, ok := v.(string); ok {
-			return s
-		}
+		// if s, ok := v.(string); ok {
+		// 	return s
+		// }
 
 		if err, ok := v.(error); ok {
 			log.Fatal(err.Error())
 		}
-		//lint:ignore SA4004 easiest way to get result as string
-		return fmt.Sprint(v)
+
+		collection = append(collection, v)
+
 	}
-	return ""
+	if len(collection) == 1 {
+		return collection[0]
+	}
+	return collection
 }
